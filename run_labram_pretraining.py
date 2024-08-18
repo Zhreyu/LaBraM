@@ -18,7 +18,7 @@ import json
 import os
 
 from pathlib import Path
-
+from rich import print
 from timm.models import create_model
 from optim_factory import create_optimizer
 
@@ -30,13 +30,17 @@ import modeling_vqnsp
 
 def get_args():
     parser = argparse.ArgumentParser('LaBraM pre-training script', add_help=False)
+    parser.add_argument('--data_path', default='new_h5_dataset', type=str, help='Path to hdf5 EEG data')
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--save_ckpt_freq', default=20, type=int)
-
+    parser.add_argument('--sampling_rate', default=500, type=int, help='Sampling rate of EEG data (e.g., 200 or 500 Hz)')
+    parser.add_argument('--number_of_seconds', default=10, type=int, help='Number of seconds for each EEG segment')
     # tokenizer settings
     parser.add_argument("--tokenizer_weight", type=str)
     parser.add_argument("--tokenizer_model", type=str, default="vqnsp_encoder_base_decoder_3x200x12")
+    
+    
     
     # Model parameters
     parser.add_argument('--model', default='labram_base_patch200_1600_8k_vocab', type=str, metavar='MODEL',
@@ -152,7 +156,7 @@ def main(args):
     utils.init_distributed_mode(args)
 
     print(args)
-
+    args.input_size = args.sampling_rate * args.number_of_seconds # 500 * 10 = 5000
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -164,24 +168,24 @@ def main(args):
     cudnn.benchmark = True
 
     model = get_model(args)
-    patch_size = model.patch_size
+    patch_size = args.sampling_rate
     print("Patch size = %s" % str(patch_size))
     args.window_size = (1, args.input_size // patch_size)
     args.patch_size = patch_size
 
     # get dataset
     # datasets with the same montage can be packed within a sublist
-    datasets_train = [
-        ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
-        ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
-    ]
-    # time window for each sublist in dataset_train
-    # to ensure the total sequence length be around 256 for each dataset
-    time_window = [
-        4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
-        8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
-    ]
-    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window, stride_size=800, start_percentage=0, end_percentage=1)
+    datasets_train = []
+    folder_path = args.data_path
+    for file_name in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file_name)
+        if os.path.isfile(file_path):
+            if file_name.endswith('.h5') or file_name.endswith('.hdf5'):
+                datasets_train.append([file_path])
+
+
+    time_window = args.input_size # 5000
+    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window=time_window, stride_size=args.sampling_rate, start_percentage=0, end_percentage=1)
     # prepare visual tokenizer
     vqnsp = get_visual_tokenizer(args).to(device)
 

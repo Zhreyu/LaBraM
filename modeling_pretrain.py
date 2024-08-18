@@ -52,7 +52,7 @@ class TemporalConv(nn.Module):
 
 
 class NeuralTransformerForMaskedEEGModeling(nn.Module):
-    def __init__(self, EEG_size=1600, patch_size=200, in_chans=1, out_chans=8, vocab_size=8192, embed_dim=200, depth=12,
+    def __init__(self, EEG_size=5000, patch_size=500, in_chans=1, out_chans=8, vocab_size=8192, embed_dim=504, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=None, init_values=None, attn_head_dim=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False, init_std=0.02):
@@ -66,10 +66,10 @@ class NeuralTransformerForMaskedEEGModeling(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         if use_abs_pos_emb:
-            self.pos_embed = nn.Parameter(torch.zeros(1, 128 + 1, embed_dim))
+            self.pos_embed = nn.Parameter(torch.zeros(1, 128  + 1, embed_dim))
         else:
             self.pos_embed = None
-        self.time_embed = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
+        self.time_embed = nn.Parameter(torch.zeros(1, 25, embed_dim), requires_grad=True)
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.rel_pos_bias = None
@@ -135,13 +135,23 @@ class NeuralTransformerForMaskedEEGModeling(nn.Module):
 
         # replace the masked visual tokens by mask_token
         w = bool_masked_pos.unsqueeze(-1).type_as(mask_token)
+        # print(f'w: {w.shape}')
+        # print(f'x: {x.shape}')
+        # print(f'mask_token: {mask_token.shape}')
+        # print(f'cls_tokens: {cls_tokens.shape}')
         x = x * (1 - w) + mask_token * w
 
         x = torch.cat((cls_tokens, x), dim=1)
-        pos_embed_used = self.pos_embed[:, input_chans] if input_chans is not None else self.pos_embed
+        # print(f'x: {x.shape}')
+        # print(f'pos_embed: {self.pos_embed.shape}')
+        # print('Input chans : ',input_chans)
+        # print(f'time_window: {time_window}')
+        pos_embed_used = self.pos_embed[:, input_chans,] if input_chans is not None else self.pos_embed
         if self.pos_embed is not None:
             pos_embed = pos_embed_used[:, 1:, :].unsqueeze(2).expand(batch_size, -1, time_window, -1).flatten(1, 2)
+            # print(f'pos_embed: {pos_embed.shape}')
             pos_embed = torch.cat((pos_embed[:,0:1,:].expand(batch_size, -1, -1), pos_embed), dim=1)
+            # print(f"pos after cat: {pos_embed.shape}")
             x = x + pos_embed
         if self.time_embed is not None:
             time_embed = self.time_embed[:, 0:time_window, :].unsqueeze(1).expand(batch_size, c, -1, -1).flatten(1, 2)
@@ -232,7 +242,7 @@ class NeuralTransformerForMaskedEEGModeling(nn.Module):
             
 
 class NeuralTransformerForMEM(nn.Module):
-    def __init__(self, EEG_size=1600, patch_size=200, in_chans=1, out_chans=8, vocab_size=8192, embed_dim=200, depth=12,
+    def __init__(self, EEG_size=5000, patch_size=500, in_chans=1, out_chans=8, vocab_size=8192, embed_dim=500, depth=12,
                  num_heads=10, mlp_ratio=4., qkv_bias=True, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=None, init_values=None, attn_head_dim=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False, init_std=0.02, **kwargs):
@@ -257,6 +267,10 @@ class NeuralTransformerForMEM(nn.Module):
     def forward(self, x, input_chans=None, bool_masked_pos=None):
         x_masked = self.student(x, input_chans, bool_masked_pos, return_all_patch_tokens=True)
         x_masked_no_cls = x_masked[:, 1:]
+        # print(f'x_masked_no_cls: {x_masked_no_cls.shape}')
+        # print(f'bool_masked_pos: {bool_masked_pos.shape}')
+        # print(f'x shape: {x.shape}')
+        # print(f'x mask shape: {x_masked.shape}')
         x_rec = self.lm_head(x_masked_no_cls[bool_masked_pos])
 
         #symetric
@@ -277,7 +291,7 @@ def labram_base_patch200_1600_8k_vocab(pretrained=False, **kwargs): #5M
     else:
         vocab_size = 8192
     model = NeuralTransformerForMEM(
-        patch_size=200, embed_dim=200, depth=12, num_heads=10, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6),
+        patch_size=500, embed_dim=504, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6),
         norm_layer=partial(nn.LayerNorm, eps=1e-6), vocab_size=vocab_size, **kwargs)
     model.default_cfg = _cfg()
     if pretrained:
@@ -298,7 +312,7 @@ def labram_large_patch200_1600_8k_vocab(pretrained=False, **kwargs): #50M
     else:
         vocab_size = 8192
     model = NeuralTransformerForMEM(
-        patch_size=200, embed_dim=400, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6), out_chans=16,
+        patch_size=500, embed_dim=1008, depth=24, num_heads=24, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6), out_chans=16,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), vocab_size=vocab_size, **kwargs)
     model.default_cfg = _cfg()
     if pretrained:
@@ -318,7 +332,7 @@ def labram_huge_patch200_1600_8k_vocab(pretrained=False, **kwargs): #380M
     else:
         vocab_size = 8192
     model = NeuralTransformerForMEM(
-        patch_size=200, embed_dim=800, depth=48, num_heads=16, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6), out_chans=32,
+        patch_size=500, embed_dim=2016, depth=48, num_heads=48, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6), out_chans=32,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), vocab_size=vocab_size, **kwargs)
     model.default_cfg = _cfg()
     if pretrained:

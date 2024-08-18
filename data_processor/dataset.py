@@ -9,7 +9,7 @@ list_path = List[Path]
 
 class SingleShockDataset(Dataset):
     """Read single hdf5 file regardless of label, subject, and paradigm."""
-    def __init__(self, file_path: Path, window_size: int=200, stride_size: int=1, start_percentage: float=0, end_percentage: float=1):
+    def __init__(self, file_path: Path, window_size: int=500, stride_size: int=1, start_percentage: float=0, end_percentage: float=1):
         '''
         Extract datasets from file_path.
 
@@ -36,7 +36,10 @@ class SingleShockDataset(Dataset):
         self.__init_dataset()
 
     def __init_dataset(self) -> None:
+        print(f"Attempting to open file: {self.__file_path}")
+
         self.__file = h5py.File(str(self.__file_path), 'r')
+        
         self.__subjects = [i for i in self.__file]
 
         global_idx = 0
@@ -79,7 +82,7 @@ class SingleShockDataset(Dataset):
 
 class ShockDataset(Dataset):
     """integrate multiple hdf5 files"""
-    def __init__(self, file_paths: list_path, window_size: int=200, stride_size: int=1, start_percentage: float=0, end_percentage: float=1):
+    def __init__(self, file_paths: list_path, window_size: int=5000, stride_size: int=1, start_percentage: float=0, end_percentage: float=1):
         '''
         Arguments will be passed to SingleShockDataset. Refer to SingleShockDataset.
         '''
@@ -88,7 +91,7 @@ class ShockDataset(Dataset):
         self.__stride_size = stride_size
         self.__start_percentage = start_percentage
         self.__end_percentage = end_percentage
-
+        
         self.__datasets = []
         self.__length = None
         self.__feature_size = None

@@ -3,7 +3,7 @@ import mne
 import numpy as np
 
 
-def preprocessing_cnt(cntFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200):
+def preprocessing_cnt(cntFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=500):
     # reading cnt
     raw = mne.io.read_raw_cnt(cntFilePath, preload=True, data_format='int32')
     raw.drop_channels(['M1', 'M2', 'VEO', 'HEO'])
@@ -20,7 +20,7 @@ def preprocessing_cnt(cntFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200):
     return eegData, raw.ch_names
 
 
-def preprocessing_edf(edfFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200, drop_channels: list=None, standard_channels: list=None):
+def preprocessing_edf(edfFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=500, drop_channels: list=None, standard_channels: list=None):
     # reading edf
     raw = mne.io.read_raw_edf(edfFilePath, preload=True)
     if drop_channels is not None:

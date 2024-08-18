@@ -1,0 +1,11 @@
+
+# tokenizer training
+nohup torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 run_vqnsp_training.py --quantize_kmeans_init --opt adamw --opt_betas 0.9 0.99 --weight_decay 1e-4 --epochs 3 --warmup_epochs 1 --codebook_emd_dim 64 --codebook_n_emd 8192 --model vqnsp_encoder_base_decoder_3x200x12 --num_workers 0 --output_dir 'output/' --log_dir 'logs/' --sampling_rate 500 --number_of_seconds 10 --data_path 'new_h5_dataset/' &> log_neural_tokenizer.txt &
+
+# load the tokenizer weights and train the labram model
+nohup torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 run_labram_pretraining.py  --output_dir ./checkpoints/labram_base --log_dir ./log/labram_base --model labram_base_patch200_1600_8k_vocab --tokenizer_model vqnsp_encoder_base_decoder_3x200x12 --tokenizer_weight output/checkpoint.pth --batch_size 64 --lr 5e-4 --warmup_epochs 5 --clip_grad 3.0 --drop_path 0. --layer_scale_init_value 0.1 --opt_betas 0.9 0.98 --opt_eps 1e-8 --epochs 50 --save_ckpt_freq 5 --codebook_dim 64 --gradient_accumulation_steps 1 --number_of_seconds 10 --sampling_rate 500 --data_path 'new_h5_dataset' --num_workers 0 &> log_labram_training.txt &
+
+# finetuning the model with the BIP dataset (LOOCV)
+nohup torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 run_class_LOOCV.py  --output_dir ./checkpoints/finetune_tuab_base/  --log_dir ./log/finetune_tuab_base  --model labram_base_patch200_200  --weight_decay 0.05  --batch_size 1 --lr 5e-4 --update_freq 1 --warmup_epochs 1 --layer_decay 0.65 --drop_path 0.1 --dataset_path "C:\Users\shreyas\Documents\GitHub\RandomBIP" --dataset "BIP" --finetune 'checkpoint-4.pth' --epochs 5 --use_loocv --log_dir "log" &> log_labram_finetune.txt &
+
+#NOTE: finetuning file is not fully ready yet, need to verify the metrics for it. please modify the epochs and other hyperparameters accordingly.

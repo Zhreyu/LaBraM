@@ -25,7 +25,7 @@ from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import ModelEma
 from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
-
+from rich import print
 from engine_for_finetuning import train_one_epoch, evaluate
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
@@ -38,7 +38,8 @@ def get_args():
     parser.add_argument('--epochs', default=30, type=int)
     parser.add_argument('--update_freq', default=1, type=int)
     parser.add_argument('--save_ckpt_freq', default=5, type=int)
-
+    parser.add_argument('--sampling_rate', default=500, type=int)
+    parser.add_argument('--number_of_seconds', default=10, type=int)
     # robust evaluation
     parser.add_argument('--robust_test', default=None, type=str,
                         help='robust evaluation dataset')
@@ -57,7 +58,7 @@ def get_args():
     parser.add_argument('--layer_scale_init_value', default=0.1, type=float, 
                         help="0.1 for base, 1e-5 for large. set 0 to disable layer scale")
 
-    parser.add_argument('--input_size', default=200, type=int,
+    parser.add_argument('--input_size', default=5000, type=int,
                         help='EEG input size')
 
     parser.add_argument('--drop', type=float, default=0.0, metavar='PCT',

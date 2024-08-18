@@ -16,9 +16,8 @@ import torch
 import torch.backends.cudnn as cudnn
 import json
 import os
-
+from rich import print
 from pathlib import Path
-
 from timm.models import create_model
 from optim_factory import create_optimizer
 
@@ -35,7 +34,8 @@ def get_args():
     parser.add_argument('--save_ckpt_freq', default=20, type=int)
     # Model parameters
     parser.add_argument('--model', default='vqnsp_encoder_base_decoder_3x200x12', type=str, metavar='MODEL',  help='Name of model to train')  
-
+    parser.add_argument('--sampling_rate', default=500, type=int, metavar='N', help='sampling rate of EEG data')
+    parser.add_argument('--number_of_seconds', default=3, type=int, metavar='N', help='number of seconds for each EEG data')
     parser.add_argument('--codebook_n_emd', default=8192, type=int, metavar='MODEL',
                         help='number of codebook')
     parser.add_argument('--codebook_emd_dim', default=32, type=int, metavar='MODEL',
@@ -101,7 +101,7 @@ def get_args():
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem',
                         help='')
     parser.set_defaults(pin_mem=True)
-    
+    parser.add_argument('--data_path', default='new_h5_dataset', type=str, metavar='PATH',)
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
@@ -129,7 +129,7 @@ def get_model(args, **kwargs):
 
 def main(args):
     utils.init_distributed_mode(args)
-
+    args.input_size = args.sampling_rate * args.number_of_seconds
     print(args)
 
     device = torch.device(args.device)
@@ -146,25 +146,30 @@ def main(args):
 
     # get dataset
     # datasets with the same montage can be packed within a sublist
-    datasets_train = [
-        ["path/to/dataset1", "path/to/dataset2"], # e.g., 64 channels for dataset1 and dataset2
-        ["path/to/dataset3", "path/to/dataset4"], # e.g., 32 channels for dataset3 and dataset4
-    ]
-    # time window for each sublist in dataset_train
-    # to ensure the total sequence length be around 256 for each dataset
-    time_window = [
-        4, # set the time window to 4 so that the sequence length is 4 * 64 = 256
-        8, # set the time window to 8 so that the sequence length is 8 * 32 = 256
-    ]
-    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window, stride_size=200)
+    datasets_train = []
+    folder_path = args.data_path
+    for file_name in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file_name)
+        if os.path.isfile(file_path):
+            if file_name.endswith('.h5') or file_name.endswith('.hdf5'):
+                datasets_train.append([file_path]) 
+    time_window = args.input_size
+    print("Datasets = %s" % str(datasets_train))
+    # print("Time window = %s" % str(time_window))
+    dataset_train_list, train_ch_names_list = utils.build_pretraining_dataset(datasets_train, time_window=time_window, stride_size=args.sampling_rate)
 
     datasets_val = [
-        ["path/to/datasets_val"]
+        datasets_train[0]  # BUG: The training does not work if the validation dataset is not specified. Therefore #HACK: we use a sample from training dataset 
+
     ]
+    
+    
+    time_window=args.input_size
     if args.disable_eval:
         dataset_val_list = None
     else:
-        dataset_val_list, val_ch_names_list = utils.build_pretraining_dataset(datasets_val, [4])
+        dataset_val_list, val_ch_names_list = utils.build_pretraining_dataset(datasets_val, time_window=time_window, stride_size=args.sampling_rate)
+        
 
     if True:  # args.distributed:
         num_tasks = utils.get_world_size()

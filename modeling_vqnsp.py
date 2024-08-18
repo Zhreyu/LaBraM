@@ -27,7 +27,7 @@ class VQNSP(nn.Module):
                  embed_dim=32,
                  decay=0.99,
                  quantize_kmeans_init=True,
-                 decoder_out_dim=200,
+                 decoder_out_dim=500,
                  smooth_l1_loss = False,
                  **kwargs
                  ):
@@ -40,6 +40,7 @@ class VQNSP(nn.Module):
         # encoder & decode params
         print('Final encoder config', encoder_config)
         self.encoder = NeuralTransformer(**encoder_config)
+
 
         print('Final decoder config', decoder_config)
         self.decoder = NeuralTransformer(**decoder_config)
@@ -62,12 +63,13 @@ class VQNSP(nn.Module):
         self.decode_task_layer = nn.Sequential(
             nn.Linear(decoder_config['embed_dim'], decoder_config['embed_dim']),
             nn.Tanh(),
-            nn.Linear(decoder_config['embed_dim'], self.decoder_out_dim),
+            nn.Linear(decoder_config['embed_dim'], self.decoder_out_dim) # for rec,
         )
+
         self.decode_task_layer_angle = nn.Sequential(
             nn.Linear(decoder_config['embed_dim'], decoder_config['embed_dim']),
             nn.Tanh(),
-            nn.Linear(decoder_config['embed_dim'], self.decoder_out_dim),
+            nn.Linear(decoder_config['embed_dim'], self.decoder_out_dim) # for rec,
         )
 
         self.kwargs = kwargs
@@ -127,7 +129,9 @@ class VQNSP(nn.Module):
         # reshape tokens to feature maps for patch embed in decoder
         # quantize = rearrange(quantize, 'b (h w) c -> b c h w', h=self.token_shape[0], w=self.token_shape[1])
         decoder_features = self.decoder(quantize, input_chans, return_patch_tokens=True)
+        # print(f'decoder_features shape: {decoder_features.shape}')
         rec = self.decode_task_layer(decoder_features)
+        
         rec_angle = self.decode_task_layer_angle(decoder_features)
         return rec, rec_angle
     
@@ -136,6 +140,7 @@ class VQNSP(nn.Module):
         return self.get_tokens(x, input_chans, **kwargs)['token']
     
     def calculate_rec_loss(self, rec, target):
+        # print(f'rec shape: {rec.shape}, target shape: {target.shape}')
         target = rearrange(target, 'b n a c -> b (n a) c')
         rec_loss = self.loss_fn(rec, target)
         return rec_loss
@@ -151,7 +156,7 @@ class VQNSP(nn.Module):
         x: shape [B, N, T]
         """
 
-        x = rearrange(x, 'B N (A T) -> B N A T', T=200)
+        x = rearrange(x, 'B N (A T) -> B N A T', T=500)
         x_fft = torch.fft.fft(x, dim=-1)
         amplitude = torch.abs(x_fft)
         amplitude = self.std_norm(amplitude)
@@ -175,7 +180,7 @@ class VQNSP(nn.Module):
         return loss, log
 
 def get_model_default_params():
-    return dict(EEG_size=1600, patch_size=200, in_chans=1, num_classes=1000, embed_dim=200, depth=12, num_heads=10,  
+    return dict(EEG_size=1600, patch_size=500, in_chans=1, num_classes=1000, embed_dim=504, depth=12, num_heads=12,  
                              mlp_ratio=4., qkv_bias=True,  qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0., 
                              norm_layer=partial(nn.LayerNorm, eps=1e-6), init_values=0., use_abs_pos_emb=True, 
                              use_rel_pos_bias=False, use_shared_rel_pos_bias=False, use_mean_pooling=True, init_scale=0.001)
@@ -194,7 +199,8 @@ def vqnsp_encoder_base_decoder_3x200x12(pretrained=False, pretrained_weight=None
     decoder_config['in_chans'] = code_dim
     decoder_config['num_classes'] = 0
     decoder_config['depth'] = 3
-    decoder_out_dim = 200
+    # decoder_config['embed_dim'] = 504
+    decoder_out_dim = 500
 
     model = VQNSP(encoder_config, decoder_config, n_code, code_dim, 
                  decoder_out_dim=decoder_out_dim, **kwargs)
@@ -235,7 +241,7 @@ def vqnsp_encoder_large_decoder_3x200x24(pretrained=False, pretrained_weight=Non
     decoder_config['in_chans'] = code_dim
     decoder_config['num_classes'] = 0
     decoder_config['depth'] = 3
-    decoder_out_dim = 200
+    decoder_out_dim = 500
 
     model = VQNSP(encoder_config, decoder_config, n_code, code_dim, 
                  decoder_out_dim=decoder_out_dim, **kwargs)
@@ -264,7 +270,6 @@ def vqnsp_encoder_large_decoder_3x200x24(pretrained=False, pretrained_weight=Non
 
 if __name__ == '__main__':
     pass
-
 
 
 

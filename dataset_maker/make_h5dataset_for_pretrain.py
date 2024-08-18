@@ -9,7 +9,7 @@ group = rawDataPath.glob('*.cnt')
 # preprocessing parameters
 l_freq = 0.1
 h_freq = 75.0
-rsfreq = 200
+rsfreq = 500
 
 # channel number * rsfreq
 chunks = (62, rsfreq)

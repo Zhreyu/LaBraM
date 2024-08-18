@@ -130,6 +130,9 @@ class Attention(nn.Module):
         if self.q_bias is not None:
             qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
         # qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        # print(f'x shape: {x.shape}')
+        # print(f'qkv_bias shape: {qkv_bias.shape}')
+        # print(f'weight shape: {self.qkv.weight.shape}')
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
         qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple) (B, H, N, C)
@@ -212,7 +215,7 @@ class Block(nn.Module):
 class PatchEmbed(nn.Module):
     """ EEG to Patch Embedding
     """
-    def __init__(self, EEG_size=2000, patch_size=200, in_chans=1, embed_dim=200):
+    def __init__(self, EEG_size=5000, patch_size=500, in_chans=1, embed_dim=504):
         super().__init__()
         # EEG_size = to_2tuple(EEG_size)
         # patch_size = to_2tuple(patch_size)
@@ -261,8 +264,8 @@ class TemporalConv(nn.Module):
 
 
 class NeuralTransformer(nn.Module):
-    def __init__(self, EEG_size=1600, patch_size=200, in_chans=1, out_chans=8, num_classes=1000, embed_dim=200, depth=12,
-                 num_heads=10, mlp_ratio=4., qkv_bias=False, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
+    def __init__(self, EEG_size=5000, patch_size=500, in_chans=1, out_chans=8, num_classes=1000, embed_dim=504, depth=12,
+                 num_heads=12, mlp_ratio=4., qkv_bias=False, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
                  use_mean_pooling=True, init_scale=0.001, **kwargs):
@@ -280,10 +283,10 @@ class NeuralTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         # self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         if use_abs_pos_emb:
-            self.pos_embed = nn.Parameter(torch.zeros(1, 128 + 1, embed_dim), requires_grad=True)
+            self.pos_embed = nn.Parameter(torch.zeros(1,128+ 1, embed_dim), requires_grad=True)
         else:
             self.pos_embed = None
-        self.time_embed = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
+        self.time_embed = nn.Parameter(torch.zeros(1, 25, embed_dim), requires_grad=True)
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         self.rel_pos_bias = None
@@ -464,9 +467,9 @@ class NeuralTransformer(nn.Module):
 
 
 @register_model
-def labram_base_patch200_200(pretrained=False, **kwargs):
+def labram_base_patch200_200(pretrained=False, **kwargs): # the 
     model = NeuralTransformer(
-        patch_size=200, embed_dim=200, depth=12, num_heads=10, mlp_ratio=4, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
+        patch_size=500, embed_dim=504, depth=12, num_heads=12, mlp_ratio=4, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
     return model
@@ -474,7 +477,7 @@ def labram_base_patch200_200(pretrained=False, **kwargs):
 @register_model
 def labram_large_patch200_200(pretrained=False, **kwargs):
     model = NeuralTransformer(
-        patch_size=200, embed_dim=400, depth=24, num_heads=16, mlp_ratio=4, out_chans=16, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
+        patch_size=500, embed_dim=1008, depth=24, num_heads=24, mlp_ratio=4, out_chans=16, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
     return model
@@ -482,7 +485,7 @@ def labram_large_patch200_200(pretrained=False, **kwargs):
 @register_model
 def labram_huge_patch200_200(pretrained=False, **kwargs):
     model = NeuralTransformer(
-        patch_size=200, embed_dim=800, depth=48, num_heads=16, mlp_ratio=4, out_chans=32, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
+        patch_size=500, embed_dim=2016, depth=48, num_heads=16, mlp_ratio=4, out_chans=32, qk_norm=partial(nn.LayerNorm, eps=1e-6), # qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     model.default_cfg = _cfg()
     return model

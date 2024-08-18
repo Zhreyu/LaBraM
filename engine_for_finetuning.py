@@ -62,7 +62,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     param_group["weight_decay"] = wd_schedule_values[it]
 
         samples = samples.float().to(device, non_blocking=True) / 100
-        samples = rearrange(samples, 'B N (A T) -> B N A T', T=200)
+        # Adjust based on the sampling rate
+        samples = rearrange(samples, 'B N (A T) -> B N A T', T=500)
         
         targets = targets.to(device, non_blocking=True)
         if is_binary:
@@ -171,7 +172,9 @@ def evaluate(data_loader, model, device, header='Test:', ch_names=None, metrics=
         EEG = batch[0]
         target = batch[-1]
         EEG = EEG.float().to(device, non_blocking=True) / 100
-        EEG = rearrange(EEG, 'B N (A T) -> B N A T', T=200)
+        # Adjust based on the sampling rate
+        EEG = rearrange(EEG, 'B N (A T) -> B N A T', T=500)
+
         target = target.to(device, non_blocking=True)
         if is_binary:
             target = target.float().unsqueeze(-1)

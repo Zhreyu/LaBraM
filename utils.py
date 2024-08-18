@@ -19,7 +19,8 @@ from collections import defaultdict, deque
 import datetime
 import numpy as np
 from timm.utils import get_state_dict
-
+from torch.utils.data import Dataset,Subset
+from rich import print
 from pathlib import Path
 import argparse
 
@@ -54,6 +55,22 @@ standard_1020 = [
     'CCP1', 'CCP2', 'CCP3', 'CCP4', 'CCP5', 'CCP6', 'CCP7', 'CCP8', \
     'T1', 'T2', 'FTT9h', 'TTP7h', 'TPP9h', 'FTT10h', 'TPP8h', 'TPP10h', \
     "FP1-F7", "F7-T7", "T7-P7", "P7-O1", "FP2-F8", "F8-T8", "T8-P8", "P8-O2", "FP1-F3", "F3-C3", "C3-P3", "P3-O1", "FP2-F4", "F4-C4", "C4-P4", "P4-O2"
+]
+
+ieeg_order = [
+    'LCA1', 'RCA1', 'CA1',           # CA1 types grouped together
+    'LDG', 'RDG', 'DG',              # DG types grouped together
+    'LPRC', 'RPRC',                  # PRC types grouped together
+    'LHC', 'RHC',                    # Hippocampus types grouped together
+    'LAMG', 'RAMG',                  # Amygdala types grouped together
+    'LPHG', 'RPHG',                  # Parahippocampal types grouped together
+    'HPC', 'PHC', 'PHG', 'SUBG',     # Other specific brain regions
+    'LSUB',                          # SUB (subiculum)
+    'ERC', 'ENT', 'FFG', 'STG',      # Temporal and gyrus regions
+    'CGG', 'MTG', 'UNC',             # Gyrus and Uncus
+    'BA28', 'BA35', 'BA36', 'BA38',  # Brodmann areas
+    'AMG',                           # Amygdala
+    'compensation'                   # Compensation at the end
 ]
 
 
@@ -137,6 +154,11 @@ class SmoothedValue(object):
             global_avg=self.global_avg,
             max=self.max,
             value=self.value)
+
+def save_subject_wise_metrics(output_dir, subjects, metrics):
+    df = pd.DataFrame(metrics)
+    df['Subject'] = subjects
+    df.to_csv(os.path.join(output_dir, 'subject_wise_metrics.csv'), index=False)
 
 
 class MetricLogger(object):
@@ -426,7 +448,7 @@ def init_distributed_mode(args):
     args.distributed = True
 
     torch.cuda.set_device(args.gpu)
-    args.dist_backend = 'nccl'
+    args.dist_backend = 'gloo'
     print('| distributed init (rank {}): {}, gpu {}'.format(
         args.rank, args.dist_url, args.gpu), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
@@ -700,20 +722,21 @@ def create_ds_config(args):
         writer.write(json.dumps(ds_config, indent=2))
 
 
-def build_pretraining_dataset(datasets: list, time_window: list, stride_size=200, start_percentage=0, end_percentage=1):
+def build_pretraining_dataset(datasets: list, time_window: int, stride_size, start_percentage=0, end_percentage=1):
     shock_dataset_list = []
     ch_names_list = []
-    for dataset_list, window_size in zip(datasets, time_window):
-        dataset = ShockDataset([Path(file_path) for file_path in dataset_list], window_size * 200, stride_size, start_percentage, end_percentage)
+    for dataset_list in datasets:
+        dataset = ShockDataset([Path(file_path) for file_path in dataset_list], time_window, stride_size, start_percentage, end_percentage)
         shock_dataset_list.append(dataset)
         ch_names_list.append(dataset.get_ch_names())
     return shock_dataset_list, ch_names_list
 
 
+
 def get_input_chans(ch_names):
     input_chans = [0] # for cls token
     for ch_name in ch_names:
-        input_chans.append(standard_1020.index(ch_name) + 1)
+        input_chans.append(ieeg_order.index(ch_name) + 1)
     return input_chans
 
 
@@ -824,3 +847,98 @@ def get_metrics(output, target, metrics, is_binary, threshold=0.5):
             target, output, metrics=metrics
         )
     return results
+
+
+def get_subject_path_bip(base_dir):
+    subject_paths = []
+    walk_list = list(os.walk(base_dir))
+    sorted_walk_list = sorted(walk_list, key=lambda x: x[0])
+
+    for root, dirs, files in sorted_walk_list:
+        if 'FoundationData.npy' in files and 'Events.npy' in files:
+            subject_paths.append(root)
+    return subject_paths
+
+
+def load_data_bip(base_dir):
+    subject_paths = get_subject_path_bip(base_dir)
+    foundation_files = [os.path.join(path, 'FoundationData.npy') for path in subject_paths]
+    # print(foundation_files)
+    # print(subject_paths)
+    event_files = [os.path.join(path, 'Events.npy') for path in subject_paths]
+    #event_files = [os.path.join(path, 'StudyOutcomes.csv')for path in subject_paths]
+
+    subjects = [os.path.basename(path).split('_')[0] for path in subject_paths]
+    print(subjects)
+    return foundation_files, event_files, subjects
+
+def prepare_BIP_dataset(root):
+    # Load the data
+    all_data, event_files, subjects = load_data_bip(root)
+    print('Finetuning on', len(all_data), 'subjects')
+    
+    # Initialize the dataset using your custom loader
+    dataset = BIPLoader(all_data, event_files)
+    
+    # Calculate the number of samples for each split
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    
+    # Create indices for train, val, test splits
+    train_indices = list(range(0, train_size))
+    val_indices = list(range(train_size, train_size + val_size))
+    test_indices = list(range(train_size + val_size, len(dataset)))
+    
+    # Use Subset to create train, val, and test datasets
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+    test_dataset = Subset(dataset, test_indices)
+    
+    # Return the datasets
+    return train_dataset, val_dataset, test_dataset
+
+class BIPLoader(Dataset):
+    def __init__(self, file_paths, labels, chunk_len=500, overlap=0, normalization=True):
+        self.normalization = normalization
+
+        self.data = []
+        self.labels = []
+
+        for data_path, label_path in zip(file_paths, labels):
+            foundation_data = np.load(data_path)
+            events_data = np.load(label_path)
+
+            if np.isnan(foundation_data).any():
+                print(f"\nNaN values found in data: {data_path} or {label_path} !!!!!!!")
+                continue
+
+            selected_rows = foundation_data[:, :9, :]
+            last_row_expanded = np.expand_dims(foundation_data[:, -1, :], axis=1)
+            selected_rows = np.concatenate((selected_rows, last_row_expanded), axis=1)
+
+            slices = selected_rows[:, :, 3101:4001]
+            for i in range(slices.shape[0]):
+                self.data.append(slices[i])
+                self.labels.append(1 if events_data[i, -1] == 1 else 0)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        data = self.data[index]
+        
+        # Ensure the length is divisible by 500
+        total_len = data.shape[1]
+        if total_len % 500 != 0:
+            padding_len = 500 - (total_len % 500)
+            padding = np.zeros((data.shape[0], padding_len))
+            data = np.concatenate((data, padding), axis=1)
+        
+        # Convert the data to a tensor
+        signal = torch.tensor(data, dtype=torch.float)
+        label = torch.tensor(self.labels[index], dtype=torch.long)
+
+        return signal, label
+
+    

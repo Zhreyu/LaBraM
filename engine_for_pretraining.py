@@ -85,7 +85,8 @@ def train_one_epoch(model: torch.nn.Module, vqnsp: torch.nn.Module,
 
             samples = batch
             samples = samples.float().to(device, non_blocking=True) / 100
-            samples = rearrange(samples, 'B N (A T) -> B N A T', T=200)
+            samples = rearrange(samples, 'B N (A T) -> B N A T', T=args.sampling_rate if args.sampling_rate else 500)
+
             bool_masked_pos = random_masking(samples.flatten(1, 2), mask_ratio=0.5).to(device, non_blocking=True)
 
             with torch.no_grad():
