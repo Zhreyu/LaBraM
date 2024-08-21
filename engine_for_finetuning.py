@@ -17,6 +17,7 @@ from einops import rearrange
 
 def train_class_batch(model, samples, target, criterion, ch_names):
     outputs = model(samples, ch_names)
+    # print('OUT AND TARGET : ',outputs.shape, target.shape)
     loss = criterion(outputs, target)
     return loss, outputs
 
@@ -41,7 +42,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
-
+    total_steps = len(lr_schedule_values)
     if loss_scaler is None:
         model.zero_grad()
         model.micro_steps = 0
@@ -49,12 +50,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         optimizer.zero_grad()
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # print(f"Batch {data_iter_step}: Samples size {samples.size()}, Targets size {targets.size()}")
+        
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
         it = start_steps + step  # global training iteration
         # Update LR & WD for the first acc
-        if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0:
+        if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0: 
             for i, param_group in enumerate(optimizer.param_groups):
                 if lr_schedule_values is not None:
                     param_group["lr"] = lr_schedule_values[it] * param_group.get("lr_scale", 1.0)

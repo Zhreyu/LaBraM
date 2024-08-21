@@ -35,6 +35,7 @@ import pickle
 from scipy.signal import resample
 from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn
 import pandas as pd
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import r2_score
 from sklearn.metrics import mean_squared_error
 from scipy.stats import pearsonr
@@ -874,37 +875,56 @@ def load_data_bip(base_dir):
 
 def prepare_BIP_dataset(root):
     # Load the data
-    all_data, event_files, subjects = load_data_bip(root)
-    print('Finetuning on', len(all_data), 'subjects')
-    
-    # Initialize the dataset using your custom loader
-    dataset = BIPLoader(all_data, event_files)
-    
-    # Calculate the number of samples for each split
-    train_size = int(0.8 * len(dataset))
-    val_size = int(0.1 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    
-    # Create indices for train, val, test splits
-    train_indices = list(range(0, train_size))
-    val_indices = list(range(train_size, train_size + val_size))
-    test_indices = list(range(train_size + val_size, len(dataset)))
-    
-    # Use Subset to create train, val, and test datasets
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
-    test_dataset = Subset(dataset, test_indices)
-    
-    # Return the datasets
+    all_files, event_files, subjects = load_data_bip(root)
+    print('Finetuning on', len(all_files), 'data files')
+
+    unique_subjects = list(set(subjects))
+
+    gss = GroupShuffleSplit(n_splits=1, train_size=0.7, random_state=42)
+
+    # Split into train and remaining (val + test) using unique subjects
+    train_subjects_idx, remaining_subjects_idx = next(gss.split(unique_subjects, groups=unique_subjects))
+    train_subjects = [unique_subjects[i] for i in train_subjects_idx]
+    remaining_subjects = [unique_subjects[i] for i in remaining_subjects_idx]
+
+    train_indices = [i for i, subj in enumerate(subjects) if subj in train_subjects]
+    remaining_indices = [i for i, subj in enumerate(subjects) if subj in remaining_subjects]
+
+    gss_val_test = GroupShuffleSplit(n_splits=1, train_size=0.5, random_state=42)
+    val_subjects_idx, test_subjects_idx = next(gss_val_test.split(remaining_subjects, groups=remaining_subjects))
+    val_subjects = [remaining_subjects[i] for i in val_subjects_idx]
+    test_subjects = [remaining_subjects[i] for i in test_subjects_idx]
+
+    val_indices = [i for i, subj in enumerate(subjects) if subj in val_subjects]
+    test_indices = [i for i, subj in enumerate(subjects) if subj in test_subjects]
+
+    # Create file and event lists for each dataset
+    train_files = [all_files[i] for i in train_indices]
+    train_events = [event_files[i] for i in train_indices]
+    val_files = [all_files[i] for i in val_indices]
+    val_events = [event_files[i] for i in val_indices]
+    test_files = [all_files[i] for i in test_indices]
+    test_events = [event_files[i] for i in test_indices]
+
+    train_dataset = BIPLoader(train_files, train_events)
+    val_dataset = BIPLoader(val_files, val_events)
+    test_dataset = BIPLoader(test_files, test_events)
+
     return train_dataset, val_dataset, test_dataset
+    
+
 
 class BIPLoader(Dataset):
-    def __init__(self, file_paths, labels, chunk_len=500, overlap=0, normalization=True):
+    def __init__(self, file_paths, labels, chunk_len=500,overlap=0, normalization=True):
+        self.chunk_len = chunk_len  # Set chunk length (500)
+        self.target_len = 1000  # Desired length for each segment
+        self.ovlp = self.chunk_len - (self.target_len // 2)  # Calculate the ovlp to get a chunk of 1000
         self.normalization = normalization
 
         self.data = []
         self.labels = []
-
+        self.data_indices = []
+        
         for data_path, label_path in zip(file_paths, labels):
             foundation_data = np.load(data_path)
             events_data = np.load(label_path)
@@ -913,32 +933,47 @@ class BIPLoader(Dataset):
                 print(f"\nNaN values found in data: {data_path} or {label_path} !!!!!!!")
                 continue
 
-            selected_rows = foundation_data[:, :9, :]
-            last_row_expanded = np.expand_dims(foundation_data[:, -1, :], axis=1)
+            selected_rows = foundation_data[:, :9, :]  # Select the first 9 channels
+            last_row_expanded = np.expand_dims(foundation_data[:, -1, :], axis=1)  # Expand the last channel
             selected_rows = np.concatenate((selected_rows, last_row_expanded), axis=1)
 
-            slices = selected_rows[:, :, 3101:4001]
+            slices = selected_rows[:, :, :900]  # Slice the data to keep only 900 samples
             for i in range(slices.shape[0]):
                 self.data.append(slices[i])
                 self.labels.append(1 if events_data[i, -1] == 1 else 0)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        data = self.data[index]
-        
-        # Ensure the length is divisible by 500
-        total_len = data.shape[1]
-        if total_len % 500 != 0:
-            padding_len = 500 - (total_len % 500)
-            padding = np.zeros((data.shape[0], padding_len))
-            data = np.concatenate((data, padding), axis=1)
-        
-        # Convert the data to a tensor
-        signal = torch.tensor(data, dtype=torch.float)
-        label = torch.tensor(self.labels[index], dtype=torch.long)
-
-        return signal, label
-
+                
+        self.data_indices = self._create_data_indices()
     
+    def __len__(self):
+        return len(self.data_indices)
+
+    def _create_data_indices(self):
+        data_indices = []
+        for file_idx, data in enumerate(self.data):
+            total_len = data.shape[1]  # Length of the samples (900 in this case)
+            stride = self.chunk_len - self.ovlp  # Adjust the stride to account for ovlp
+            
+            # Generate indices to create ovlpping chunks that form 1000-sample segments
+            for i in range(0, total_len - self.chunk_len + 1, stride):
+                data_indices.append((file_idx, i))
+        return data_indices
+    
+    def __getitem__(self, index):
+        file_idx, start_idx = self.data_indices[index]
+        data = self.data[file_idx]
+
+        # Create a chunk of 1000 samples by combining two ovlpping chunks
+        end_idx1 = start_idx + self.chunk_len
+        end_idx2 = start_idx + 2 * self.chunk_len - self.ovlp
+
+        chunk1 = data[:, start_idx:end_idx1]  # First 500 samples
+        chunk2 = data[:, (end_idx1 - 100):end_idx2]  # Next 500 samples with ovlp
+        # print(f'Size of chunk 1 {chunk1.shape}')
+        # print(f'Size of chunk 2 {chunk2.shape}')
+        # Concatenate the two chunks along the time dimension to create a 1000-sample segment
+        signal = np.concatenate((chunk1, chunk2), axis=1)
+        # print('Signal Shape : ',signal.shape)
+        signal = torch.tensor(signal, dtype=torch.float)
+        label = torch.tensor(self.labels[file_idx], dtype=torch.long)
+        # print(f'Signal Shape: {signal.shape} and Label: {label}')
+        return signal, label

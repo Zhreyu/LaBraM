@@ -1,28 +1,16 @@
-# --------------------------------------------------------
-# Large Brain Model for Learning Generic Representations with Tremendous EEG Data in BCI
-# By Wei-Bang Jiang
-# Based on BEiT-v2, timm, DeiT, and DINO code bases
-# https://github.com/microsoft/unilm/tree/master/beitv2
-# https://github.com/rwightman/pytorch-image-models/tree/master/timm
-# https://github.com/facebookresearch/deit/
-# https://github.com/facebookresearch/dino
-# ---------------------------------------------------------
-from rich import print
+#######################################################################
+# Runs the LaBraM model on synthetic EEG data for fine-tuning and evaluation.
+
 import argparse
 import datetime
 from pyexpat import model
 import numpy as np
 import time
-import copy
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-import sklearn
 import torch
 import torch.backends.cudnn as cudnn
 import json
 import os
-from sklearn.model_selection import LeaveOneGroupOut, train_test_split
+
 from pathlib import Path
 from collections import OrderedDict
 from timm.data.mixup import Mixup
@@ -30,21 +18,37 @@ from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import ModelEma
 from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
-from torch.utils.data.dataloader import default_collate
-os.environ["USE_LIBUV"] = "0"
+from rich import print
 from engine_for_finetuning import train_one_epoch, evaluate
-from utils import BIPLoader, NativeScalerWithGradNormCount as NativeScaler, load_data_bip , save_subject_wise_metrics
+from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
-from sklearn.model_selection import LeaveOneOut
 from scipy import interpolate
 import modeling_finetune
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+def split_data(file_paths, test_size=0.2, finetune_size=0.2):
+    """
+    Splits data into pretraining, finetuning, and test datasets.
+    `test_size` is the proportion of the data to reserve for final testing.
+    `finetune_size` is the proportion of the remaining data to use for finetuning.
+    """
+    # Split off the test dataset first
+    remaining_files, test_files = train_test_split(file_paths, test_size=test_size, random_state=42)
+
+    # Split the remaining data into pretraining and finetuning datasets
+    pretrain_files, finetune_files = train_test_split(remaining_files, test_size=finetune_size, random_state=42)
+
+    return pretrain_files, finetune_files, test_files
+
 def get_args():
     parser = argparse.ArgumentParser('LaBraM fine-tuning and evaluation script for EEG classification', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--epochs', default=30, type=int)
     parser.add_argument('--update_freq', default=1, type=int)
     parser.add_argument('--save_ckpt_freq', default=5, type=int)
-
+    parser.add_argument('--sampling_rate', default=500, type=int)
+    parser.add_argument('--number_of_seconds', default=10, type=int)
     # robust evaluation
     parser.add_argument('--robust_test', default=None, type=str,
                         help='robust evaluation dataset')
@@ -95,7 +99,7 @@ def get_args():
     parser.add_argument('--weight_decay_end', type=float, default=None, help="""Final value of the
         weight decay. We use a cosine schedule for WD and using a larger decay by
         the end of training improves performance for ViTs.""")
-    parser.add_argument('--use_loocv', action='store_true', default=False)
+
     parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         help='learning rate (default: 5e-4)')
     parser.add_argument('--layer_decay', type=float, default=0.9)
@@ -136,7 +140,6 @@ def get_args():
     parser.add_argument('--disable_weight_decay_on_rel_pos_bias', action='store_true', default=False)
 
     # Dataset parameters
-    parser.add_argument('--dataset_path', default='', type=str, metavar='PATH',)
     parser.add_argument('--nb_classes', default=0, type=int,
                         help='number of the classification types')
 
@@ -170,7 +173,6 @@ def get_args():
     parser.set_defaults(pin_mem=True)
 
     # distributed training parameters
-    parser.add_argument('--distributed', action='store_true', default=False)
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
@@ -179,10 +181,10 @@ def get_args():
                         help='url used to set up distributed training')
 
     parser.add_argument('--enable_deepspeed', action='store_true', default=False)
-    parser.add_argument('--dataset', default='BIP', type=str,
+    parser.add_argument('--dataset', default='TUAB', type=str,
                         help='dataset: TUAB | TUEV')
-    parser.add_argument('--sampling_rate', default=500, type=int,)
-    parser.add_argument('--number_of_seconds', default=10, type=int,)
+    parser.add_argument('--sub_list', default='', type=str,)
+    parser.add_argument('--root_path', default='', type=str,)
     known_args, _ = parser.parse_known_args()
 
     if known_args.enable_deepspeed:
@@ -234,29 +236,75 @@ def get_dataset(args):
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 6
         metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-    elif args.dataset == "BIP":
-        args.nb_classes = 1
-        train_dataset, test_dataset, val_dataset = utils.prepare_BIP_dataset(args.dataset_path)
-        # ch_names = ['LHC', 'RHC', 'LCA1', 'RCA1', 'PHC', 'ERC', 'LAMG', 'RAMG', 'CA1', 'Comp'] #TODO: Add channel names in dataset preparation
-        ch_names = None
-        metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
-        # metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"] #cant be used as all labels are either one or zero.
-        
     return train_dataset, test_dataset, val_dataset, ch_names, metrics
 
-def safe_collate(batch):
-    # Clone each tensor in each tuple (signal, label) to ensure independence
-    cloned_batch = [(data.clone(), target.clone()) for data, target in batch]
-    return default_collate(cloned_batch)
+import torch
+from torch.utils.data import Dataset
+
+class SyntheticDataset(Dataset):
+    def __init__(self, file_paths, labels=None, chunk_len=500, normalization=True, include_labels=False):
+        self.file_paths = file_paths
+        self.labels = labels if labels is not None else [-1] * len(file_paths)  # Dummy labels if not provided
+        self.chunk_len = chunk_len
+        self.normalization = normalization
+        self.include_labels = include_labels
+        self.data_indices = self._create_data_indices()
+
+    def _create_data_indices(self):
+        indices = []
+        for file_idx, filename in enumerate(self.file_paths):
+            data = torch.load(filename)[:10]  # Load tensor and take first 10 channels
+            total_length = data.shape[1]
+            num_chunks = total_length // self.chunk_len
+            last_chunk_size = total_length % self.chunk_len
+
+            # Append indices for full chunks
+            for i in range(num_chunks):
+                start_idx = i * self.chunk_len
+                indices.append((file_idx, start_idx))
+
+            # Handle last partial chunk, if exists
+            if last_chunk_size != 0:
+                start_idx = total_length - self.chunk_len  # Start at the last possible full chunk
+                indices.append((file_idx, start_idx))
+
+        return indices
+
+    def __len__(self):
+        return len(self.data_indices)
+
+    def __getitem__(self, index):
+        file_idx, start_idx = self.data_indices[index]
+        data = torch.load(self.file_paths[file_idx])[:10, start_idx:start_idx + self.chunk_len]
+        if self.normalization:
+            mean = data.mean(dim=1, keepdim=True)
+            std = data.std(dim=1, keepdim=True)
+            std[std == 0] = 1  # Prevent division by zero
+            data = (data - mean) / std
+        if self.include_labels:
+            label = self.labels[file_idx]
+            return data, torch.tensor(label, dtype=torch.long)
+        return data
+
+import pandas as pd
+def read_threshold_sub(csv_file, lower_bound=2599, upper_bound=1000000):
+    df_read = pd.read_csv(csv_file)
+    filenames = df_read['filename'].tolist()
+    time_lens = df_read['time_len'].tolist()
+    filtered_files = []
+    for fn, tlen in zip(filenames, time_lens):
+        if (tlen > lower_bound) and (tlen < upper_bound):
+            filtered_files.append(fn)
+    return filtered_files
 
 def main(args, ds_init):
     utils.init_distributed_mode(args)
-    global_rank = 0
+
     if ds_init is not None:
         utils.create_ds_config(args)
 
     print(args)
-    
+
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -266,21 +314,28 @@ def main(args, ds_init):
     # random.seed(seed)
 
     cudnn.benchmark = True
-
+    print("Root Path is: ", args.root_path)
+    filenames = read_threshold_sub(args.sub_list)
+    filenames = [os.path.join(args.root_path, fn) for fn in filenames]
+    train_files, finetune_files, test_files = split_data(filenames, test_size=0.1, finetune_size=0.2)
     # dataset_train, dataset_test, dataset_val: follows the standard format of torch.utils.data.Dataset.
     # ch_names: list of strings, channel names of the dataset. It should be in capital letters.
     # metrics: list of strings, the metrics you want to use. We utilize PyHealth to implement it.
-
-
-
-    dataset_train, dataset_test, dataset_val, ch_names, metrics = get_dataset(args)
-
-    #TODO: This is a temporary filling. The dataset should be split into train, test, and val in the prepare_BIP_dataset function
+    train_labels = [0 if 'class1_erp' in fn else 1 for fn in train_files]
+    test_labels = [0 if 'class1_erp' in fn else 1 for fn in test_files]
+    val_labels = [0 if 'class1_erp' in fn else 1 for fn in finetune_files]
+    dataset_train = SyntheticDataset(train_files,labels=train_labels ,chunk_len=500, normalization=True, include_labels=True,)
+    dataset_test = SyntheticDataset(test_files,labels = test_labels, chunk_len=500, normalization=True, include_labels=True)
+    dataset_val = SyntheticDataset(finetune_files,labels=val_labels ,chunk_len=500, normalization=True, include_labels=True)
+    ch_names = None
+    args.nb_classes = 1
+    metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
+    
     if args.disable_eval_during_finetuning:
         dataset_val = None
         dataset_test = None
 
-    if args.distributed:  # args.distributed:
+    if True:  # args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
@@ -306,7 +361,7 @@ def main(args, ds_init):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-        sampler_test = torch.utils.data.SequentialSampler(dataset_test)
+
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
@@ -319,7 +374,6 @@ def main(args, ds_init):
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
-        collate_fn=safe_collate
     )
 
     if dataset_val is not None:
@@ -328,8 +382,7 @@ def main(args, ds_init):
             batch_size=int(1.5 * args.batch_size),
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
-            drop_last=False,
-            collate_fn=safe_collate
+            drop_last=False
         )
         if type(dataset_test) == list:
             data_loader_test = [torch.utils.data.DataLoader(
@@ -337,9 +390,7 @@ def main(args, ds_init):
                 batch_size=int(1.5 * args.batch_size),
                 num_workers=args.num_workers,
                 pin_memory=args.pin_mem,
-                drop_last=False,
-                collate_fn=safe_collate
-
+                drop_last=False
             ) for dataset, sampler in zip(dataset_test, sampler_test)]
         else:
             data_loader_test = torch.utils.data.DataLoader(
@@ -347,20 +398,19 @@ def main(args, ds_init):
                 batch_size=int(1.5 * args.batch_size),
                 num_workers=args.num_workers,
                 pin_memory=args.pin_mem,
-                drop_last=False,
-                collate_fn=safe_collate
+                drop_last=False
             )
     else:
         data_loader_val = None
         data_loader_test = None
 
     model = get_models(args)
-    args.input_size = args.number_of_seconds * args.sampling_rate
-    patch_size = args.sampling_rate
-    print("Patch size = %s" % str(patch_size))
-    args.window_size = args.input_size
-    args.patch_size = patch_size
 
+    patch_size = 500
+    print("Patch size = %s" % str(patch_size))
+    args.window_size = (1, args.input_size // patch_size)
+    args.patch_size = patch_size
+    
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -496,219 +546,96 @@ def main(args, ds_init):
             balanced_accuracy.append(test_stats['balanced_accuracy'])
         print(f"======Accuracy: {np.mean(accuracy)} {np.std(accuracy)}, balanced accuracy: {np.mean(balanced_accuracy)} {np.std(balanced_accuracy)}")
         exit(0)
-    if args.use_loocv:
-        print("Starting Leave-One-Out Cross Validation for IEEG data.")
-        all_data, event_files, subjects = load_data_bip(args.dataset_path)
-        loo = LeaveOneGroupOut()
-        cv_results = []
-        fold = 0
-        subject_wise_metrics = []
-        best_model = None
-        best_accuracy = 0.0
-        best_subject = None
+
+    print(f"Start training for {args.epochs} epochs")
+    start_time = time.time()
+    max_accuracy = 0.0
+    max_accuracy_test = 0.0
+    for epoch in range(args.start_epoch, args.epochs):
+        if args.distributed:
+            data_loader_train.sampler.set_epoch(epoch)
+        if log_writer is not None:
+            log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train, optimizer,
+            device, epoch, loss_scaler, args.clip_grad, model_ema,
+            log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
+            lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
+            num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq, 
+            ch_names=ch_names, is_binary=args.nb_classes == 1
+        )
         
-        for train_index, test_index in loo.split(all_data, event_files, groups=subjects):
-            train_files = [all_data[i] for i in train_index]
-            train_events = [event_files[i] for i in train_index]
-            test_files = [all_data[i] for i in test_index]
-            test_events = [event_files[i] for i in test_index]
-            train_subjects = [subjects[i] for i in train_index]
-            test_subject = subjects[test_index[0]]
-            
-            train_dataset = BIPLoader(train_files, train_events)
-            test_dataset = BIPLoader(test_files, test_events)
-
-            weight = sklearn.utils.class_weight.compute_class_weight(
-                'balanced', 
-                classes=np.unique(train_dataset.labels), 
-                y=train_dataset.labels
-            )
-            weight = torch.tensor(weight).to(device)
-            total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-            num_training_steps_per_epoch = len(train_dataset) // total_batch_size
-            lr_schedule_values = utils.cosine_scheduler(
-                args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
-                warmup_epochs=args.warmup_epochs,
-            )
-            wd_schedule_values = utils.cosine_scheduler(
-                args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch,
-                warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps  
-            )
-
-            pos_weight = torch.tensor(weight[1]).to(device)
-            if args.nb_classes == 1:
-                criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            else:
-                criterion = torch.nn.CrossEntropyLoss(weight=weight)
-            data_loader_train = torch.utils.data.DataLoader(
-                train_dataset, batch_size=args.batch_size,
-                num_workers=args.num_workers, pin_memory=args.pin_mem, drop_last=True, collate_fn=safe_collate)
-            data_loader_val = torch.utils.data.DataLoader(
-                test_dataset, batch_size=1,
-                num_workers=args.num_workers, pin_memory=args.pin_mem, drop_last=False, collate_fn=safe_collate)
-
-            model = get_models(args)
-            model.to(device)
-            optimizer = create_optimizer(args, model)
-            
-            if log_writer is not None:
-                log_writer.set_step(fold * args.epochs * len(data_loader_train))
-            
-            print(f"Fold {fold}")
-            print(f'Training Subjects: {train_subjects}')
-            print('Validation Subject:', test_subject)
-            print(f"Length of lr_schedule_values: {len(lr_schedule_values)}")
-            print(f"Length of wd_schedule_values: {len(wd_schedule_values)}")
-            print(f"Expected num_training_steps_per_epoch: {num_training_steps_per_epoch}")
-            print(f"Total steps (epochs x num_training_steps_per_epoch): {args.epochs * num_training_steps_per_epoch}")
-            
-            best_fold_accuracy = 0.0
-            best_fold_model = None
-            
-            for epoch in range(args.epochs):
-                train_stats = train_one_epoch(model, criterion, data_loader_train, optimizer,
-                                            device, epoch, loss_scaler, args.clip_grad, model_ema,
-                                            log_writer=log_writer, start_steps=epoch * len(data_loader_train),
-                                            lr_schedule_values=lr_schedule_values, 
-                                            wd_schedule_values=wd_schedule_values,
-                                            num_training_steps_per_epoch=len(data_loader_train), 
-                                            update_freq=args.update_freq,
-                                            ch_names=ch_names, is_binary=args.nb_classes == 1)
-                print(f"Epoch {epoch}: {train_stats}")
-                
-                val_stats = evaluate(data_loader_val, model, device, header='Val:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
-                print(f"Accuracy of the network for subject {test_subject} val IEEG: {val_stats['accuracy']:.2f}%")
-                
-                if log_writer is not None:
-                    # Extract each metric and its value from train_stats and pass them to the update method
-                    log_writer.update(head="train", step=(fold * args.epochs + epoch) * len(data_loader_train), **train_stats)
-                    # Similarly, for validation stats
-                    log_writer.update(head="val", step=(fold * args.epochs + epoch) * len(data_loader_train), **val_stats)
-
-                
-                if val_stats['accuracy'] > best_fold_accuracy:
-                    best_fold_accuracy = val_stats['accuracy']
-                    best_fold_model = copy.deepcopy(model.state_dict())
-            
-            cv_results.append(val_stats)
-            subject_wise_metrics.append({**val_stats, 'Subject': test_subject})
-            
-            if best_fold_accuracy > best_accuracy:
-                best_accuracy = best_fold_accuracy
-                best_model = best_fold_model
-                best_subject = test_subject
-            
-            fold += 1
-        
-        # Save the best model
         if args.output_dir and args.save_ckpt:
-            best_model_path = os.path.join(args.output_dir, "best_loocv_model.pth")
-            torch.save(best_model, best_model_path)
-            print(f"Best model saved to {best_model_path}")
-        
-        # Compute and print average results across all folds
-        avg_results = {metric: np.mean([result[metric] for result in cv_results]) for metric in metrics}
-        print(f"LOOCV Results (Averaged out scores): {avg_results}")
-        
-        # Print best model results
-        print(f"Best model performance:")
-        print(f"Subject: {best_subject}")
-        print(f"Accuracy: {best_accuracy:.2f}%")
-        
-        # Save subject-wise metrics to a CSV file
-        save_subject_wise_metrics(args.log_dir, [m['Subject'] for m in subject_wise_metrics], subject_wise_metrics)
-        print(f"Subject-wise metrics saved to {os.path.join(args.log_dir, 'subject_wise_metrics.csv')}")
-
-    else:
-        print(f"Start training for {args.epochs} epochs")
-        start_time = time.time()
-        max_accuracy = 0.0
-        max_accuracy_test = 0.0
-        for epoch in range(args.start_epoch, args.epochs):
-            if args.distributed:
-                data_loader_train.sampler.set_epoch(epoch)
-            if log_writer is not None:
-                log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
-            train_stats = train_one_epoch(
-                model, criterion, data_loader_train, optimizer,
-                device, epoch, loss_scaler, args.clip_grad, model_ema,
-                log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
-                lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-                num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq, 
-                ch_names=ch_names, is_binary=args.nb_classes == 1
-            )
+            utils.save_model(
+                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema, save_ckpt_freq=args.save_ckpt_freq)
             
-            if args.output_dir and args.save_ckpt:
-                utils.save_model(
-                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                    loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema, save_ckpt_freq=args.save_ckpt_freq)
+        if data_loader_val is not None:
+            val_stats = evaluate(data_loader_val, model, device, header='Val:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
+            print(f"Accuracy of the network on the {len(dataset_val)} val EEG: {val_stats['accuracy']:.2f}%")
+            test_stats = evaluate(data_loader_test, model, device, header='Test:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
+            print(f"Accuracy of the network on the {len(dataset_test)} test EEG: {test_stats['accuracy']:.2f}%")
+            
+            if max_accuracy < val_stats["accuracy"]:
+                max_accuracy = val_stats["accuracy"]
+                if args.output_dir and args.save_ckpt:
+                    utils.save_model(
+                        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                        loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
+                max_accuracy_test = test_stats["accuracy"]
+
+            print(f'Max accuracy val: {max_accuracy:.2f}%, max accuracy test: {max_accuracy_test:.2f}%')
+            if log_writer is not None:
+                for key, value in val_stats.items():
+                    if key == 'accuracy':
+                        log_writer.update(accuracy=value, head="val", step=epoch)
+                    elif key == 'balanced_accuracy':
+                        log_writer.update(balanced_accuracy=value, head="val", step=epoch)
+                    elif key == 'f1_weighted':
+                        log_writer.update(f1_weighted=value, head="val", step=epoch)
+                    elif key == 'pr_auc':
+                        log_writer.update(pr_auc=value, head="val", step=epoch)
+                    elif key == 'roc_auc':
+                        log_writer.update(roc_auc=value, head="val", step=epoch)
+                    elif key == 'cohen_kappa':
+                        log_writer.update(cohen_kappa=value, head="val", step=epoch)
+                    elif key == 'loss':
+                        log_writer.update(loss=value, head="val", step=epoch)
+                for key, value in test_stats.items():
+                    if key == 'accuracy':
+                        log_writer.update(accuracy=value, head="test", step=epoch)
+                    elif key == 'balanced_accuracy':
+                        log_writer.update(balanced_accuracy=value, head="test", step=epoch)
+                    elif key == 'f1_weighted':
+                        log_writer.update(f1_weighted=value, head="test", step=epoch)
+                    elif key == 'pr_auc':
+                        log_writer.update(pr_auc=value, head="test", step=epoch)
+                    elif key == 'roc_auc':
+                        log_writer.update(roc_auc=value, head="test", step=epoch)
+                    elif key == 'cohen_kappa':
+                        log_writer.update(cohen_kappa=value, head="test", step=epoch)
+                    elif key == 'loss':
+                        log_writer.update(loss=value, head="test", step=epoch)
                 
-            if data_loader_val is not None:
-                val_stats = evaluate(data_loader_val, model, device, header='Val:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
-                print(f"Accuracy of the network on the {len(dataset_val)} val EEG: {val_stats['accuracy']:.2f}%")
-                test_stats = evaluate(data_loader_test, model, device, header='Test:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
-                print(f"Accuracy of the network on the {len(dataset_test)} test EEG: {test_stats['accuracy']:.2f}%")
-                
-                if max_accuracy < val_stats["accuracy"]:
-                    max_accuracy = val_stats["accuracy"]
-                    if args.output_dir and args.save_ckpt:
-                        utils.save_model(
-                            args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                            loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
-                    max_accuracy_test = test_stats["accuracy"]
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                         **{f'val_{k}': v for k, v in val_stats.items()},
+                         **{f'test_{k}': v for k, v in test_stats.items()},
+                         'epoch': epoch,
+                         'n_parameters': n_parameters}
+        else:
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                         'epoch': epoch,
+                         'n_parameters': n_parameters}
 
-                print(f'Max accuracy val: {max_accuracy:.2f}%, max accuracy test: {max_accuracy_test:.2f}%')
-                if log_writer is not None:
-                    for key, value in val_stats.items():
-                        if key == 'accuracy':
-                            log_writer.update(accuracy=value, head="val", step=epoch)
-                        elif key == 'balanced_accuracy':
-                            log_writer.update(balanced_accuracy=value, head="val", step=epoch)
-                        elif key == 'f1_weighted':
-                            log_writer.update(f1_weighted=value, head="val", step=epoch)
-                        elif key == 'pr_auc':
-                            log_writer.update(pr_auc=value, head="val", step=epoch)
-                        elif key == 'roc_auc':
-                            log_writer.update(roc_auc=value, head="val", step=epoch)
-                        elif key == 'cohen_kappa':
-                            log_writer.update(cohen_kappa=value, head="val", step=epoch)
-                        elif key == 'loss':
-                            log_writer.update(loss=value, head="val", step=epoch)
-                    for key, value in test_stats.items():
-                        if key == 'accuracy':
-                            log_writer.update(accuracy=value, head="test", step=epoch)
-                        elif key == 'balanced_accuracy':
-                            log_writer.update(balanced_accuracy=value, head="test", step=epoch)
-                        elif key == 'f1_weighted':
-                            log_writer.update(f1_weighted=value, head="test", step=epoch)
-                        elif key == 'pr_auc':
-                            log_writer.update(pr_auc=value, head="test", step=epoch)
-                        elif key == 'roc_auc':
-                            log_writer.update(roc_auc=value, head="test", step=epoch)
-                        elif key == 'cohen_kappa':
-                            log_writer.update(cohen_kappa=value, head="test", step=epoch)
-                        elif key == 'loss':
-                            log_writer.update(loss=value, head="test", step=epoch)
-                    
-                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                            **{f'val_{k}': v for k, v in val_stats.items()},
-                            **{f'test_{k}': v for k, v in test_stats.items()},
-                            'epoch': epoch,
-                            'n_parameters': n_parameters}
-            else:
-                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                            'epoch': epoch,
-                            'n_parameters': n_parameters}
+        if args.output_dir and utils.is_main_process():
+            if log_writer is not None:
+                log_writer.flush()
+            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
 
-            if args.output_dir and utils.is_main_process():
-                if log_writer is not None:
-                    log_writer.flush()
-                with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('Training time {}'.format(total_time_str))
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
